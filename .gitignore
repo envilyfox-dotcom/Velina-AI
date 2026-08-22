@@ -1,0 +1,21 @@
+# secrets
+.env
+
+# virtual environment
+.venv/
+
+# model weights
+*.gguf
+*.safetensors
+
+# datasets (private)
+*.csv
+*.jsonl
+velina_examples.JSON
+
+# python cache
+__pycache__/
+*.pyc
+
+# model
+Modelfile
