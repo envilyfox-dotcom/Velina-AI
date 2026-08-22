@@ -70,7 +70,3 @@ The fine-tuned model weights (`.gguf`) and the `Modelfile` are **not included** 
 ## Training Data
 
 The dataset is not included in this repository. It consists of ~220 custom conversational examples across categories including casual conversation, emotional support, humor, playful banter, greetings, and multi-turn exchanges — built to teach a consistent, natural texting-style personality rather than an assistant-like tone.
-
-## License
-
-*(Add your preferred license here — e.g. MIT)*
