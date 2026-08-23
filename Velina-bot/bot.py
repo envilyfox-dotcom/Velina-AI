@@ -34,6 +34,15 @@ TARGET_CHANNEL_IDS = {
 }
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # set your Discord user ID in .env
 
+# Guild IDs derived from TARGET_CHANNEL_IDS at runtime. Public commands are
+# refused outside these guilds, so even if the bot ends up installed
+# somewhere unauthorized (e.g. via "Add App" / user install), it won't let
+# outsiders change shared state like SYSTEM_PROMPT that affects every
+# server the bot is in. This is a backstop -- the real fix is disabling
+# "Public Bot" and "User Install" in the Discord Developer Portal so the
+# bot can't be added anywhere else in the first place.
+ALLOWED_GUILD_IDS: set = set()
+
 DEFAULT_SYSTEM_PROMPT = ""
 SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
 MAX_HISTORY = 10  # number of past messages to remember per channel
@@ -180,6 +189,46 @@ def owner_only():
     return app_commands.check(predicate)
 
 
+async def refresh_allowed_guilds():
+    """Recompute ALLOWED_GUILD_IDS from the guilds that TARGET_CHANNEL_IDS
+    currently belong to. Call this after startup and whenever
+    TARGET_CHANNEL_IDS changes (setchannel/removechannel)."""
+    global ALLOWED_GUILD_IDS
+    guild_ids = set()
+    for cid in TARGET_CHANNEL_IDS:
+        channel = bot.get_channel(cid)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(cid)
+            except discord.HTTPException:
+                logging.warning("Could not resolve channel %s to a guild", cid)
+                continue
+        guild = getattr(channel, "guild", None)
+        if guild is not None:
+            guild_ids.add(guild.id)
+    ALLOWED_GUILD_IDS = guild_ids
+    logging.info("Allowed guilds: %s", ALLOWED_GUILD_IDS)
+
+
+def guild_allowed():
+    """Refuses public commands run outside ALLOWED_GUILD_IDS. This is a
+    backstop against the bot being added to unauthorized servers (e.g. via
+    'Add App' / user install) -- without it, anyone who can invoke a public
+    command from anywhere could change shared state (like SYSTEM_PROMPT)
+    that affects every server the bot is in. The bot owner always passes,
+    since they're trusted regardless of which server they're testing from."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if OWNER_ID != 0 and interaction.user.id == OWNER_ID:
+            return True
+        if interaction.guild_id is None or interaction.guild_id not in ALLOWED_GUILD_IDS:
+            await interaction.response.send_message(
+                "-- This bot isn't set up for use in this server. --", ephemeral=True
+            )
+            return False
+        return True
+    return app_commands.check(predicate)
+
+
 async def send_chunked(sendable, text: str):
     """Send text in <=2000 char chunks using either an interaction followup
     or a text channel, whichever is passed in."""
@@ -225,6 +274,8 @@ async def on_ready():
         # and not a stale cached version.
     except Exception:
         logging.exception("Failed to sync slash commands")
+
+    await refresh_allowed_guilds()
 
 
 @bot.tree.error
@@ -274,6 +325,7 @@ async def on_message(message: discord.Message):
 # ---------- SLASH COMMANDS ----------
 
 @bot.tree.command(name="reset", description="Clear conversation history and reset persona")
+@guild_allowed()
 async def reset_command(interaction: discord.Interaction):
     global SYSTEM_PROMPT
     channel_id = await require_channel_id(interaction)
@@ -285,6 +337,7 @@ async def reset_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="forget", description="Clear conversation history only, keep the current persona")
+@guild_allowed()
 async def forget_command(interaction: discord.Interaction):
     channel_id = await require_channel_id(interaction)
     if channel_id is None:
@@ -294,6 +347,7 @@ async def forget_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="persona", description="View or temporarily change Velina's persona")
+@guild_allowed()
 @app_commands.describe(
     new_prompt=f"New system prompt, max {MAX_PERSONA_LENGTH} chars "
                "(Warning: This is effectively a reset, the bot will forget the old persona and conversation history)"
@@ -333,6 +387,7 @@ async def persona_command(
 
 
 @bot.tree.command(name="save_persona", description="Save the current persona to disk under a name")
+@guild_allowed()
 @app_commands.describe(name=f"Name for this preset, max {MAX_PERSONA_NAME_LENGTH} chars")
 async def save_persona_command(
     interaction: discord.Interaction,
@@ -363,6 +418,7 @@ async def save_persona_command(
 
 
 @bot.tree.command(name="load_persona", description="Load a saved persona preset by name")
+@guild_allowed()
 @app_commands.describe(name="Name of the saved preset to load")
 async def load_persona_command(interaction: discord.Interaction, name: str):
     global SYSTEM_PROMPT
@@ -385,6 +441,7 @@ async def load_persona_command(interaction: discord.Interaction, name: str):
 
 
 @bot.tree.command(name="list_personas", description="List all saved persona presets")
+@guild_allowed()
 async def list_personas_command(interaction: discord.Interaction):
     personas = load_personas()
     if not personas:
@@ -396,6 +453,7 @@ async def list_personas_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="undo", description="Remove the last message exchange from history")
+@guild_allowed()
 async def undo_command(interaction: discord.Interaction):
     channel_id = await require_channel_id(interaction)
     if channel_id is None:
@@ -415,6 +473,7 @@ async def undo_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="regenerate", description="Re-run the last message to get a different response")
+@guild_allowed()
 async def regenerate_command(interaction: discord.Interaction):
     global message_count
 
@@ -451,6 +510,7 @@ async def regenerate_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="start", description="Have the bot start a brand new, random conversation")
+@guild_allowed()
 async def start_command(interaction: discord.Interaction):
     global message_count
 
@@ -472,6 +532,7 @@ async def start_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="history", description="Show the recent conversation history the bot is holding")
+@guild_allowed()
 @app_commands.describe(count="How many recent messages to show (default 10, max 10)")
 async def history_command(interaction: discord.Interaction, count: Optional[app_commands.Range[int, 1, MAX_HISTORY]] = None):
     channel_id = await require_channel_id(interaction)
@@ -492,6 +553,7 @@ async def history_command(interaction: discord.Interaction, count: Optional[app_
 
 
 @bot.tree.command(name="stats", description="Show bot status and stats")
+@guild_allowed()
 async def stats_command(interaction: discord.Interaction):
     uptime_seconds = int(time.monotonic() - bot_start_time) if bot_start_time else 0
     hours, remainder = divmod(uptime_seconds, 3600)
@@ -505,12 +567,12 @@ async def stats_command(interaction: discord.Interaction):
         f"**Latency:** {round(bot.latency * 1000)}ms",
         f"**Messages processed:** {message_count}",
         f"**Model:** {OLLAMA_MODEL}",
-        f"**Target channels:** {', '.join(f'<#{cid}>' for cid in TARGET_CHANNEL_IDS)}",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="ping", description="Check if the bot is responsive")
+@guild_allowed()
 async def ping_command(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! Latency: {round(bot.latency * 1000)}ms")
 
@@ -526,7 +588,7 @@ PUBLIC_COMMANDS = [
     ("/regenerate", "Re-run the last message to get a different response."),
     ("/start", "Have the bot start a brand new, randomly-styled conversation instead of waiting for you to speak first."),
     ("/history [count]", "Show the recent conversation history the bot is holding (max 10)."),
-    ("/stats", "Show bot status: uptime, latency, messages processed, active model, target channel."),
+    ("/stats", "Show bot status: uptime, latency, messages processed, active model."),
     ("/ping", "Check if the bot is responsive."),
     ("/help", "Show this list."),
 ]
@@ -542,6 +604,7 @@ OWNER_COMMANDS = [
 
 
 @bot.tree.command(name="help", description="List available commands and what they do")
+@guild_allowed()
 async def help_command(interaction: discord.Interaction):
     lines = ["**Available commands:**"]
     for name, desc in PUBLIC_COMMANDS:
@@ -566,6 +629,7 @@ async def help_command(interaction: discord.Interaction):
 @app_commands.describe(channel="The channel to add to the bot's active channel list")
 async def setchannel_command(interaction: discord.Interaction, channel: discord.TextChannel):
     TARGET_CHANNEL_IDS.add(channel.id)
+    await refresh_allowed_guilds()
     await interaction.response.send_message(f"-- Added {channel.mention} to active channels. --", ephemeral=True)
 
 
@@ -584,6 +648,7 @@ async def removechannel_command(interaction: discord.Interaction, channel: disco
         )
         return
     TARGET_CHANNEL_IDS.discard(channel.id)
+    await refresh_allowed_guilds()
     await interaction.response.send_message(f"-- Removed {channel.mention} from active channels. --", ephemeral=True)
 
 
