@@ -12,6 +12,7 @@
 *.csv
 *.jsonl
 velina_examples.JSON
+personas.json
 
 # python cache
 __pycache__/
