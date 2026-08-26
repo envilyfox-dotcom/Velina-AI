@@ -1,3 +1,7 @@
 discord.py
+discord-ext-voice-recv
+PyNaCl
 aiohttp
 python-dotenv
+faster-whisper
+edge-tts
