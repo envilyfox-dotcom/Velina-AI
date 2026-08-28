@@ -24,5 +24,5 @@ __pycache__/
 # model
 Modelfile
 
-# miscellaneous
-FUTURE_IMPROVEMENTS.md
+# personal notes
+*.md
