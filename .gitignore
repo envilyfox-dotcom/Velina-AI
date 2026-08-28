@@ -15,6 +15,7 @@ manifests/
 *.jsonl
 velina_examples.JSON
 personas.json
+bot_state.json
 
 # python cache
 __pycache__/

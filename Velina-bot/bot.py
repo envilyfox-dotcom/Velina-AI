@@ -37,6 +37,16 @@ if not TARGET_CHANNEL_IDS_STR:
 TARGET_CHANNEL_IDS = {
     int(part.strip()) for part in TARGET_CHANNEL_IDS_STR.split(",") if part.strip()
 }
+# Optional comma-separated list of channels where the bot must remain silent.
+# These IDs override TARGET_CHANNEL_IDS, which makes it useful for temporarily
+# disabling a private test channel without changing the active-channel list.
+# An empty or missing DISABLED_CHANNELS value disables nothing.
+DISABLED_CHANNELS_STR = os.getenv("DISABLED_CHANNELS", "")
+DISABLED_CHANNEL_IDS = {
+    int(part.strip())
+    for part in DISABLED_CHANNELS_STR.split(",")
+    if part.strip()
+}
 # Comma-separated list of Discord user IDs treated as bot owners, e.g.
 #   OWNER_IDS=123456789012345678,987654321098765432
 # Useful if you control the bot from more than one Discord account.
@@ -110,11 +120,13 @@ SUMMARY_SYSTEM_PROMPT = (
 # current persona back wrapped in a ```code block```` (6 chars of backticks
 # + newlines), so we cap stored personas comfortably under that ceiling.
 MAX_PERSONA_LENGTH = 1900
+MAX_REPLY_WORDS = 150
 
 # Named persona presets are stored on disk (not in memory) so they survive
 # bot restarts and cost effectively zero RAM when not actively loaded.
 PERSONAS_FILE = "personas.json"
 MAX_PERSONA_NAME_LENGTH = 32
+STATE_FILE = "bot_state.json"
 
 # --- Multi-speaker channel support ---
 # conversation_history is shared per CHANNEL, not per user -- multiple
@@ -434,6 +446,100 @@ def save_personas(personas: dict) -> None:
         json.dump(personas, f, ensure_ascii=False, indent=2)
 
 
+def load_state() -> None:
+    """Restore persistent bot state if a previous state file exists."""
+    global OLLAMA_MODEL
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logging.exception("Failed to read %s; starting with empty runtime state", STATE_FILE)
+        return
+
+    if not isinstance(state, dict):
+        logging.warning("Ignoring %s because its root value is not an object", STATE_FILE)
+        return
+
+    saved_history = state.get("conversation_history", {})
+    if isinstance(saved_history, dict):
+        for channel_id, entries in saved_history.items():
+            try:
+                channel_id = int(channel_id)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(entries, list):
+                conversation_history[channel_id] = entries
+
+    saved_summaries = state.get("channel_summaries", {})
+    if isinstance(saved_summaries, dict):
+        for channel_id, summary in saved_summaries.items():
+            try:
+                channel_id = int(channel_id)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(summary, str) and summary:
+                channel_summaries[channel_id] = summary
+
+    saved_personas = state.get("channel_personas", {})
+    if isinstance(saved_personas, dict):
+        for channel_id, persona in saved_personas.items():
+            try:
+                channel_id = int(channel_id)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(persona, str):
+                CHANNEL_PERSONAS[channel_id] = persona
+
+    saved_paused = state.get("paused_channel_ids", [])
+    if isinstance(saved_paused, list):
+        for channel_id in saved_paused:
+            try:
+                PAUSED_CHANNEL_IDS.add(int(channel_id))
+            except (TypeError, ValueError):
+                continue
+
+    saved_model = state.get("ollama_model")
+    if isinstance(saved_model, str) and saved_model.strip():
+        OLLAMA_MODEL = saved_model.strip()
+
+    logging.info("Loaded persistent bot state from %s", STATE_FILE)
+
+
+def save_state() -> None:
+    """Persist runtime state atomically so a partial write cannot replace it."""
+    state = {
+        "conversation_history": {
+            str(channel_id): entries
+            for channel_id, entries in conversation_history.items()
+        },
+        "channel_summaries": {
+            str(channel_id): summary
+            for channel_id, summary in channel_summaries.items()
+        },
+        "channel_personas": {
+            str(channel_id): persona
+            for channel_id, persona in CHANNEL_PERSONAS.items()
+        },
+        "paused_channel_ids": sorted(PAUSED_CHANNEL_IDS),
+        "ollama_model": OLLAMA_MODEL,
+    }
+    temporary_state_file = f"{STATE_FILE}.tmp"
+    try:
+        with open(temporary_state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(temporary_state_file, STATE_FILE)
+    except OSError:
+        logging.exception("Failed to write %s", STATE_FILE)
+        try:
+            os.remove(temporary_state_file)
+        except OSError:
+            pass
+
+
 def clean_reply(reply: str) -> str:
     reply = reply.strip()
 
@@ -452,6 +558,13 @@ def clean_reply(reply: str) -> str:
 
     if match:
         reply = reply[:match.start()]
+
+    # Keep model-generated replies short enough for normal conversation.
+    # This is a word limit rather than a character limit; Discord chunking
+    # still handles unusually long words or character-heavy output.
+    words = reply.strip().split()
+    if len(words) > MAX_REPLY_WORDS:
+        reply = " ".join(words[:MAX_REPLY_WORDS]).rstrip() + "..."
 
     return reply.strip()
 
@@ -520,6 +633,7 @@ async def query_ollama(
         history.append({"role": "assistant", "content": reply})
         conversation_history[channel_id] = history
         await summarize_and_trim(channel_id)
+        save_state()
         return reply
 
     messages = build_prompt_messages(channel_id, history[-MAX_HISTORY:])
@@ -531,11 +645,13 @@ async def query_ollama(
         # This prevents a retry from seeing a stale request with no answer.
         if history and history[-1] is user_entry:
             history.pop()
+        save_state()
         raise
 
     history.append({"role": "assistant", "content": reply})
     conversation_history[channel_id] = history
     await summarize_and_trim(channel_id)
+    save_state()
     return reply
 
 
@@ -571,6 +687,7 @@ async def generate_starter(channel_id: int) -> str:
     ]
     reply = await call_ollama(messages)
     conversation_history[channel_id] = [{"role": "assistant", "content": reply}]
+    save_state()
     return reply
 
 
@@ -597,7 +714,7 @@ async def refresh_allowed_guilds():
     TARGET_CHANNEL_IDS changes (setchannel/removechannel)."""
     global ALLOWED_GUILD_IDS
     guild_ids = set()
-    for cid in TARGET_CHANNEL_IDS:
+    for cid in TARGET_CHANNEL_IDS - DISABLED_CHANNEL_IDS:
         channel = bot.get_channel(cid)
         if channel is None:
             try:
@@ -622,7 +739,10 @@ def guild_allowed():
                 "-- This bot isn't set up for use in this server. --", ephemeral=True
             )
             return False
-        if interaction.channel_id not in TARGET_CHANNEL_IDS:
+        if (
+            interaction.channel_id not in TARGET_CHANNEL_IDS
+            or interaction.channel_id in DISABLED_CHANNEL_IDS
+        ):
             await interaction.response.send_message(
                 "-- This bot isn't enabled in this channel. --", ephemeral=True
             )
@@ -648,6 +768,16 @@ async def send_chunked(sendable, text: str):
     or a text channel, whichever is passed in."""
     for i in range(0, len(text), 2000):
         await sendable.send(text[i:i + 2000])
+
+
+async def send_reply_chunked(message: discord.Message, text: str):
+    """Reply to the triggering message, then send any remaining chunks."""
+    chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
+    if not chunks:
+        return
+    await message.reply(chunks[0])
+    for chunk in chunks[1:]:
+        await message.channel.send(chunk)
 
 
 async def should_reply_to_message(message: discord.Message) -> bool:
@@ -745,7 +875,10 @@ async def _transcribe_and_respond(guild_id: int, user_id: int, pcm_bytes: bytes)
         return
     # Keep voice processing restricted to explicitly configured channels even
     # if the session was created before its channel was removed or changed.
-    if session.text_channel_id not in TARGET_CHANNEL_IDS:
+    if (
+        session.text_channel_id not in TARGET_CHANNEL_IDS
+        or session.text_channel_id in DISABLED_CHANNEL_IDS
+    ):
         return
 
     wav_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
@@ -924,7 +1057,10 @@ async def on_message(message: discord.Message):
 
     if message.author.bot:
         return
-    if message.channel.id not in TARGET_CHANNEL_IDS:
+    if (
+        message.channel.id not in TARGET_CHANNEL_IDS
+        or message.channel.id in DISABLED_CHANNEL_IDS
+    ):
         return
     if not message.content.strip():
         return
@@ -950,7 +1086,7 @@ async def on_message(message: discord.Message):
 
         message_count += 1
         if await should_reply_to_message(message):
-            await message.reply(reply)
+            await send_reply_chunked(message, reply)
         else:
             await send_chunked(message.channel, reply)
 
@@ -968,6 +1104,7 @@ async def reset_command(interaction: discord.Interaction):
     conversation_history[channel_id] = []
     CHANNEL_PERSONAS.pop(channel_id, None)
     channel_summaries.pop(channel_id, None)
+    save_state()
     await interaction.response.send_message("-- Conversation history cleared and persona reset for this channel. --")
 
 
@@ -979,6 +1116,7 @@ async def forget_command(interaction: discord.Interaction):
         return
     conversation_history[channel_id] = []
     channel_summaries.pop(channel_id, None)
+    save_state()
     await interaction.response.send_message("-- Conversation history cleared. Persona unchanged. --")
 
 
@@ -1021,6 +1159,7 @@ async def persona_command(
         CHANNEL_PERSONAS[channel_id] = new_prompt
         conversation_history[channel_id] = []  # clear so old tone doesn't linger
         channel_summaries.pop(channel_id, None)
+        save_state()
         await interaction.response.send_message("-- Persona updated and history cleared for this channel. --")
 
 
@@ -1060,29 +1199,61 @@ async def save_persona_command(
     await interaction.response.send_message(f"-- {verb} persona preset '{key}'. --", ephemeral=True)
 
 
-@bot.tree.command(name="load_persona", description="Load a saved persona preset by name into this channel")
-@guild_allowed()
-@app_commands.describe(name="Name of the saved preset to load")
-async def load_persona_command(interaction: discord.Interaction, name: str):
-    key = name.strip().lower()
-    personas = load_personas()
-    if key not in personas:
-        await interaction.response.send_message(
-            f"-- No preset named '{key}' found. Use /list_personas to see saved presets. --",
-            ephemeral=True,
+class PersonaSelect(discord.ui.Select):
+    def __init__(self, persona_names: list[str]):
+        options = [
+            discord.SelectOption(label=name, value=name)
+            for name in persona_names
+        ]
+        super().__init__(
+            placeholder="Choose a persona to load...",
+            min_values=1,
+            max_values=1,
+            options=options,
         )
-        return
 
-    channel_id = await require_channel_id(interaction)
-    if channel_id is None:
-        return
-    CHANNEL_PERSONAS[channel_id] = personas[key]
-    conversation_history[channel_id] = []  # clear so old tone doesn't linger
-    channel_summaries.pop(channel_id, None)
-    await interaction.response.send_message(f"-- Loaded persona preset '{key}' into this channel and cleared history. --")
+    async def callback(self, interaction: discord.Interaction):
+        channel_id = interaction.channel_id
+        if (
+            channel_id is None
+            or channel_id not in TARGET_CHANNEL_IDS
+            or channel_id in DISABLED_CHANNEL_IDS
+        ):
+            await interaction.response.send_message(
+                "-- This bot isn't enabled in this channel anymore. --",
+                ephemeral=True,
+            )
+            return
+
+        key = self.values[0]
+        personas = load_personas()
+        if key not in personas:
+            await interaction.response.send_message(
+                "-- That persona is no longer available. Please open /list_personas again. --",
+                ephemeral=True,
+            )
+            return
+
+        CHANNEL_PERSONAS[channel_id] = personas[key]
+        conversation_history[channel_id] = []
+        channel_summaries.pop(channel_id, None)
+        save_state()
+        await interaction.response.send_message(
+            f"-- Loaded persona preset '{key}' and cleared this channel's history. --",
+        )
 
 
-@bot.tree.command(name="list_personas", description="List all saved persona presets")
+class PersonaListView(discord.ui.View):
+    def __init__(self, persona_names: list[str]):
+        super().__init__(timeout=180)
+        # Discord allows at most 25 options per select and five select
+        # components per view. Multiple menus keep the list usable when more
+        # than 25 presets have been saved.
+        for start in range(0, min(len(persona_names), 125), 25):
+            self.add_item(PersonaSelect(persona_names[start:start + 25]))
+
+
+@bot.tree.command(name="list_personas", description="List and choose a saved persona preset")
 @guild_allowed()
 async def list_personas_command(interaction: discord.Interaction):
     personas = load_personas()
@@ -1090,8 +1261,96 @@ async def list_personas_command(interaction: discord.Interaction):
         await interaction.response.send_message("-- No saved persona presets yet. --", ephemeral=True)
         return
 
-    names = ", ".join(sorted(personas.keys()))
-    await interaction.response.send_message(f"Saved persona presets: {names}", ephemeral=True)
+    names = sorted(personas.keys())
+    lines = ["**Saved persona presets:**", ""]
+    lines.extend(f"- `{name}`" for name in names)
+    if len(names) > 125:
+        lines.extend(["", "_Only the first 125 presets can be selected here._"])
+    await interaction.response.send_message(
+        "\n".join(lines),
+        view=PersonaListView(names),
+        ephemeral=True,
+    )
+
+
+class DeletePersonaSelect(discord.ui.Select):
+    def __init__(self, persona_names: list[str]):
+        options = [
+            discord.SelectOption(label=name, value=name)
+            for name in persona_names
+        ]
+        super().__init__(
+            placeholder="Choose a persona to delete...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id not in OWNER_IDS:
+            await interaction.response.send_message(
+                "-- Only the bot owner can delete saved personas. --",
+                ephemeral=True,
+            )
+            return
+
+        key = self.values[0]
+        personas = load_personas()
+        if key not in personas:
+            await interaction.response.send_message(
+                "-- That persona is no longer available. Please run /delete_persona again. --",
+                ephemeral=True,
+            )
+            return
+
+        del personas[key]
+        try:
+            if personas:
+                save_personas(personas)
+            else:
+                # Remove the file only when its last saved preset was deleted.
+                os.remove(PERSONAS_FILE)
+        except OSError:
+            logging.exception("Failed to delete persona preset '%s'", key)
+            await interaction.response.send_message(
+                "-- Failed to delete that persona preset; check bot logs. --",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"-- Deleted saved persona preset '{key}'. --",
+            ephemeral=True,
+        )
+
+
+class DeletePersonaListView(discord.ui.View):
+    def __init__(self, persona_names: list[str]):
+        super().__init__(timeout=180)
+        # Discord allows at most 25 options per select and five select
+        # components per view.
+        for start in range(0, min(len(persona_names), 125), 25):
+            self.add_item(DeletePersonaSelect(persona_names[start:start + 25]))
+
+
+@bot.tree.command(name="delete_persona", description="[Owner only] Choose a saved persona preset to delete")
+@owner_only()
+async def delete_persona_command(interaction: discord.Interaction):
+    personas = load_personas()
+    if not personas:
+        await interaction.response.send_message("-- No saved persona presets yet. --", ephemeral=True)
+        return
+
+    names = sorted(personas.keys())
+    lines = ["**Choose a saved persona preset to delete:**", ""]
+    lines.extend(f"- `{name}`" for name in names)
+    if len(names) > 125:
+        lines.extend(["", "_Only the first 125 presets can be selected here._"])
+    await interaction.response.send_message(
+        "\n".join(lines),
+        view=DeletePersonaListView(names),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="undo", description="Remove the last message exchange from history")
@@ -1107,6 +1366,7 @@ async def undo_command(interaction: discord.Interaction):
     if history and history[-1]["role"] == "user":
         removed.append(history.pop())
     conversation_history[channel_id] = history
+    save_state()
 
     if not removed:
         await interaction.response.send_message("-- Nothing to undo. --", ephemeral=True)
@@ -1154,6 +1414,7 @@ async def regenerate_command(interaction: discord.Interaction):
             if removed_reply is not None:
                 history.append(removed_reply)
             conversation_history[channel_id] = history
+            save_state()
             logging.exception("Error querying Ollama during regenerate")
             await interaction.followup.send(f"⚠️ Error generating response: {e}")
             return
@@ -1161,6 +1422,7 @@ async def regenerate_command(interaction: discord.Interaction):
         history.append({"role": "assistant", "content": reply})
         conversation_history[channel_id] = history
         await summarize_and_trim(channel_id)
+        save_state()
 
     message_count += 1
     await send_chunked(interaction.followup, reply)
@@ -1177,7 +1439,8 @@ async def start_command(interaction: discord.Interaction):
 
     await interaction.response.defer()
     try:
-        reply = await generate_starter(channel_id)
+        async with get_channel_lock(channel_id):
+            reply = await generate_starter(channel_id)
     except Exception as e:
         logging.exception("Error querying Ollama during start")
         await interaction.followup.send(f"⚠️ Error generating response: {e}")
@@ -1245,8 +1508,7 @@ PUBLIC_COMMANDS = [
     ("/forget", "Clear conversation history only. Persona stays as-is."),
     ("/persona [new_prompt]", "View this channel's current persona (no argument), or set a new one for this channel (also clears its history)."),
     ("/save_persona <name>", "Save this channel's current persona to disk under a name for later reuse."),
-    ("/load_persona <name>", "Load a previously saved persona preset into this channel (also clears its history)."),
-    ("/list_personas", "List all saved persona preset names."),
+    ("/list_personas", "Show all saved persona names and choose one to load into this channel."),
     ("/undo", "Remove the last message exchange from history."),
     ("/regenerate", "Re-run the last message to get a different response."),
     ("/start", "Have the bot start a brand new, randomly-styled conversation instead of waiting for you to speak first."),
@@ -1263,7 +1525,8 @@ OWNER_COMMANDS = [
     ("/removechannel <channel>", "Remove a channel from the bot's active channel list."),
     ("/listchannels", "List channels the bot is currently active in."),
     ("/setmodel <model_name>", "Change the Ollama model in use."),
-    ("/announce [channel]", "Opens a form to type a multi-line, hand-formatted message and post it as the bot (bypasses the AI)."),
+    ("/delete_persona", "Show saved personas and choose one to delete. Active channel personas are unchanged."),
+    ("/announce [channel] [destination]", "Opens a form to post a hand-written message to one channel or all configured channels (bypasses the AI)."),
     ("/unmute <user>", "Lift an injection-attempt cooldown for a user (in case of a false positive)."),
     ("/voice_settings [voice] [rate] [volume] [pitch]", "View or adjust TTS voice, speed, volume, and pitch."),
     ("/pause [channel]", "Stop the bot from responding in a channel (default: current channel). Other channels are unaffected."),
@@ -1405,6 +1668,7 @@ async def listchannels_command(interaction: discord.Interaction):
 async def setmodel_command(interaction: discord.Interaction, model_name: str):
     global OLLAMA_MODEL
     OLLAMA_MODEL = model_name
+    save_state()
     await interaction.response.send_message(f"-- Model set to '{model_name}'. --", ephemeral=True)
 
 
@@ -1463,37 +1727,93 @@ class AnnounceModal(discord.ui.Modal, title="Post Announcement"):
         required=True,
     )
 
-    def __init__(self, target: discord.abc.Messageable, target_mention: Optional[str]):
+    def __init__(self, targets: list[discord.abc.Messageable], target_label: str):
         super().__init__()
-        self.target = target
-        self.target_mention = target_mention
+        self.targets = targets
+        self.target_label = target_label
 
     async def on_submit(self, interaction: discord.Interaction):
-        await send_chunked(self.target, str(self.message))
-        where = f" in {self.target_mention}" if self.target_mention else ""
-        await interaction.response.send_message(f"-- Announcement posted{where}. --", ephemeral=True)
+        # Broadcasting can take longer than Discord's initial interaction
+        # response window. Acknowledge the modal submission immediately, then
+        # send the confirmation through the follow-up webhook.
+        await interaction.response.defer(ephemeral=True)
+
+        posted = 0
+        for target in self.targets:
+            try:
+                await send_chunked(target, str(self.message))
+                posted += 1
+            except discord.HTTPException:
+                logging.exception("Failed to post announcement to one target")
+
+        if posted == 0:
+            await interaction.followup.send(
+                "-- Announcement could not be posted to any target channel. --",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"-- Announcement posted to {self.target_label}. --",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="announce", description="[Owner only] Post a raw, hand-written message as the bot (bypasses the AI)")
 @owner_only()
+@app_commands.choices(destination=[
+    app_commands.Choice(name="This channel", value="current"),
+    app_commands.Choice(name="All channels", value="all"),
+])
 @app_commands.describe(
     channel="Where to post it. Defaults to the channel you run this command in. "
             "Doesn't have to be one of the bot's active AI channels.",
+    destination="Choose this channel or all configured target channels.",
 )
 async def announce_command(
     interaction: discord.Interaction,
     channel: Optional[discord.TextChannel] = None,
+    destination: Optional[app_commands.Choice[str]] = None,
 ):
-    target = channel or interaction.channel
-    if not isinstance(target, discord.abc.Messageable):
+    targets: list[discord.abc.Messageable]
+
+    send_all = destination is not None and destination.value == "all"
+    if send_all and channel is not None:
         await interaction.response.send_message(
-            "-- Can't post to that channel type. --", ephemeral=True
+            "-- Choose either a specific channel or All channels, not both. --",
+            ephemeral=True,
         )
         return
 
+    if send_all:
+        targets = []
+        # Announcements are owner-only manual messages, so they intentionally
+        # bypass DISABLED_CHANNEL_IDS. Disabled channels remain silent for
+        # normal AI messages and public AI commands.
+        for channel_id in sorted(TARGET_CHANNEL_IDS):
+            target = get_messageable_channel(channel_id)
+            if target is not None:
+                targets.append(target)
+        if not targets:
+            await interaction.response.send_message(
+                "-- No available configured target channels were found. --",
+                ephemeral=True,
+            )
+            return
+        target_label = "all configured channels"
+    else:
+        target = channel or interaction.channel
+        if not isinstance(target, discord.abc.Messageable):
+            await interaction.response.send_message(
+                "-- Can't post to that channel type. --", ephemeral=True
+            )
+            return
+        targets = [target]
+        target_label = channel.mention if channel is not None else "this channel"
+
     # send_modal() must be the very first response to the interaction, so
     # no deferring/checks can happen after this point.
-    await interaction.response.send_modal(AnnounceModal(target, channel.mention if channel is not None else None))
+    await interaction.response.send_modal(AnnounceModal(targets, target_label))
 
 
 @bot.tree.command(name="unmute", description="[Owner only] Lift an injection-attempt cooldown for a user")
@@ -1516,6 +1836,7 @@ async def pause_command(interaction: discord.Interaction, channel: Optional[disc
     if target_id is None:
         return
     PAUSED_CHANNEL_IDS.add(target_id)
+    save_state()
     where = channel.mention if channel is not None else "this channel"
     await interaction.response.send_message(
         f"-- Bot paused in {where}. It will not respond there until /resume is run. --"
@@ -1530,6 +1851,7 @@ async def resume_command(interaction: discord.Interaction, channel: Optional[dis
     if target_id is None:
         return
     PAUSED_CHANNEL_IDS.discard(target_id)
+    save_state()
     where = channel.mention if channel is not None else "this channel"
     await interaction.response.send_message(f"-- Bot resumed in {where}. --")
 
@@ -1544,4 +1866,5 @@ async def list_paused_command(interaction: discord.Interaction):
     await interaction.response.send_message(f"Paused channels: {mentions}", ephemeral=True)
 
 
+load_state()
 bot.run(DISCORD_TOKEN)
