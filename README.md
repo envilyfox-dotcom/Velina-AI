@@ -48,7 +48,8 @@ Rather than relying purely on prompting, Velina's voice, tone, and personality a
 
 3. Set up your environment variables — create a `.env` file in the project root:
    ```
-   DISCORD_BOT_TOKEN=your_token_here
+   DISCORD_TOKEN
+   TARGET_CHANNEL_IDS
    ```
 
 4. Build the Ollama model (Modelfile and GGUF not included in this repo — see note below):

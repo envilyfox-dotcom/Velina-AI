@@ -7,6 +7,8 @@
 # model weights
 *.gguf
 *.safetensors
+blobs/
+manifests/
 
 # datasets (private)
 *.csv
@@ -20,3 +22,6 @@ __pycache__/
 
 # model
 Modelfile
+
+# miscellaneous
+FUTURE_IMPROVEMENTS.md
