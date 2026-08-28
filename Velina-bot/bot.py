@@ -613,18 +613,18 @@ async def refresh_allowed_guilds():
 
 
 def guild_allowed():
-    """Refuses public commands run outside ALLOWED_GUILD_IDS. This is a
-    backstop against the bot being added to unauthorized servers (e.g. via
-    'Add App' / user install) -- without it, anyone who can invoke a public
-    command from anywhere could change shared state that affects every
-    server the bot is in. Bot owners always pass, since they're trusted
-    regardless of which server they're testing from."""
+    """Refuses public commands outside the configured servers and channels.
+    This prevents slash commands from bypassing the same channel restriction
+    used by on_message."""
     async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.id in OWNER_IDS:
-            return True
         if interaction.guild_id is None or interaction.guild_id not in ALLOWED_GUILD_IDS:
             await interaction.response.send_message(
                 "-- This bot isn't set up for use in this server. --", ephemeral=True
+            )
+            return False
+        if interaction.channel_id not in TARGET_CHANNEL_IDS:
+            await interaction.response.send_message(
+                "-- This bot isn't enabled in this channel. --", ephemeral=True
             )
             return False
         return True
@@ -742,6 +742,10 @@ def _voice_write_callback(guild_id: int):
 async def _transcribe_and_respond(guild_id: int, user_id: int, pcm_bytes: bytes):
     session = voice_sessions.get(guild_id)
     if session is None:
+        return
+    # Keep voice processing restricted to explicitly configured channels even
+    # if the session was created before its channel was removed or changed.
+    if session.text_channel_id not in TARGET_CHANNEL_IDS:
         return
 
     wav_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
