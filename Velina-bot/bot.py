@@ -1871,3 +1871,4 @@ load_state()
 bot.run(DISCORD_TOKEN)
 
 # this is a test for Yuuna
+#this is a test for Yuuna 2
