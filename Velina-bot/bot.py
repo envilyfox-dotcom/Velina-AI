@@ -1526,7 +1526,8 @@ OWNER_COMMANDS = [
     ("/listchannels", "List channels the bot is currently active in."),
     ("/setmodel <model_name>", "Change the Ollama model in use."),
     ("/delete_persona", "Show saved personas and choose one to delete. Active channel personas are unchanged."),
-    ("/announce [channel] [destination]", "Opens a form to post a hand-written message to one channel or all configured channels (bypasses the AI)."),
+    ("/announce channel [channel]", "Opens a form to post a hand-written message to one channel (or the current channel)."),
+    ("/announce all", "Opens a form to post a hand-written message to all configured channels, including disabled channels."),
     ("/unmute <user>", "Lift an injection-attempt cooldown for a user (in case of a false positive)."),
     ("/voice_settings [voice] [rate] [volume] [pitch]", "View or adjust TTS voice, speed, volume, and pitch."),
     ("/pause [channel]", "Stop the bot from responding in a channel (default: current channel). Other channels are unaffected."),
@@ -1759,61 +1760,61 @@ class AnnounceModal(discord.ui.Modal, title="Post Announcement"):
         )
 
 
-@bot.tree.command(name="announce", description="[Owner only] Post a raw, hand-written message as the bot (bypasses the AI)")
+announce_group = app_commands.Group(
+    name="announce",
+    description="[Owner only] Post a raw, hand-written message as the bot",
+)
+bot.tree.add_command(announce_group)
+
+
+@announce_group.command(name="channel", description="Post an announcement to one channel")
 @owner_only()
-@app_commands.choices(destination=[
-    app_commands.Choice(name="This channel", value="current"),
-    app_commands.Choice(name="All channels", value="all"),
-])
 @app_commands.describe(
     channel="Where to post it. Defaults to the channel you run this command in. "
             "Doesn't have to be one of the bot's active AI channels.",
-    destination="Choose this channel or all configured target channels.",
 )
-async def announce_command(
+async def announce_channel_command(
     interaction: discord.Interaction,
     channel: Optional[discord.TextChannel] = None,
-    destination: Optional[app_commands.Choice[str]] = None,
 ):
-    targets: list[discord.abc.Messageable]
-
-    send_all = destination is not None and destination.value == "all"
-    if send_all and channel is not None:
+    target = channel or interaction.channel
+    if not isinstance(target, discord.abc.Messageable):
         await interaction.response.send_message(
-            "-- Choose either a specific channel or All channels, not both. --",
+            "-- Can't post to that channel type. --", ephemeral=True
+        )
+        return
+
+    # send_modal() must be the very first response to the interaction.
+    await interaction.response.send_modal(
+        AnnounceModal(
+            [target],
+            channel.mention if channel is not None else "this channel",
+        )
+    )
+
+
+@announce_group.command(name="all", description="Post an announcement to all configured target channels")
+@owner_only()
+async def announce_all_command(interaction: discord.Interaction):
+    targets: list[discord.abc.Messageable] = []
+    # Announcements are owner-only manual messages, so they intentionally
+    # bypass DISABLED_CHANNEL_IDS. Disabled channels remain silent for normal
+    # AI messages and public AI commands.
+    for channel_id in sorted(TARGET_CHANNEL_IDS):
+        target = get_messageable_channel(channel_id)
+        if target is not None:
+            targets.append(target)
+
+    if not targets:
+        await interaction.response.send_message(
+            "-- No available configured target channels were found. --",
             ephemeral=True,
         )
         return
 
-    if send_all:
-        targets = []
-        # Announcements are owner-only manual messages, so they intentionally
-        # bypass DISABLED_CHANNEL_IDS. Disabled channels remain silent for
-        # normal AI messages and public AI commands.
-        for channel_id in sorted(TARGET_CHANNEL_IDS):
-            target = get_messageable_channel(channel_id)
-            if target is not None:
-                targets.append(target)
-        if not targets:
-            await interaction.response.send_message(
-                "-- No available configured target channels were found. --",
-                ephemeral=True,
-            )
-            return
-        target_label = "all configured channels"
-    else:
-        target = channel or interaction.channel
-        if not isinstance(target, discord.abc.Messageable):
-            await interaction.response.send_message(
-                "-- Can't post to that channel type. --", ephemeral=True
-            )
-            return
-        targets = [target]
-        target_label = channel.mention if channel is not None else "this channel"
-
-    # send_modal() must be the very first response to the interaction, so
-    # no deferring/checks can happen after this point.
-    await interaction.response.send_modal(AnnounceModal(targets, target_label))
+    await interaction.response.send_modal(
+        AnnounceModal(targets, "all configured channels")
+    )
 
 
 @bot.tree.command(name="unmute", description="[Owner only] Lift an injection-attempt cooldown for a user")
