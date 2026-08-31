@@ -367,10 +367,15 @@ def build_prompt_messages(channel_id: int, history_slice: list) -> list:
 # STT runs locally via faster-whisper. Model is lazy-loaded on first /join,
 # not at startup, so it costs zero RAM until someone actually uses voice.
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")  # tiny/base/small/medium/large
+# CPU mode is the default because it does not require CUDA/cuBLAS/cuDNN.
+# GPU mode can still be enabled through the environment when those libraries
+# are installed.
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 # TTS runs via free edge-tts (no API key needed -- uses the same cloud
 # voices as Microsoft Edge's "Read Aloud" feature). Full voice list: run
 # `edge-tts --list-voices`, or see https://github.com/rany2/edge-tts
-TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AriaNeural")
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AvaMultilingualNeural")
 # Speed/volume/pitch tweaks. Format matches edge-tts's own syntax and also
 # works as Azure SSML <prosody> values:
 #   rate/volume: signed percentage, e.g. "+15%" or "-10%"
@@ -381,7 +386,7 @@ TTS_VOLUME = os.getenv("TTS_VOLUME", "+0%")
 TTS_PITCH = os.getenv("TTS_PITCH", "+0Hz")
 # How long a user has to go silent before we treat their utterance as
 # finished and send it off for transcription.
-VOICE_SILENCE_SECONDS = 1.2
+VOICE_SILENCE_SECONDS = 0.7
 # Discord voice PCM is 48kHz, 16-bit, stereo. This sets a minimum buffered
 # duration (in bytes) before we bother transcribing, to filter out noise
 # blips / accidental key taps.
@@ -830,8 +835,29 @@ def get_whisper_model():
     RAM stays untouched until someone actually joins voice."""
     global _whisper_model
     if _whisper_model is None:
-        logging.info("Loading faster-whisper model '%s' (first use)...", WHISPER_MODEL_SIZE)
-        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+        logging.info(
+            "Loading faster-whisper model '%s' on %s (%s) (first use)...",
+            WHISPER_MODEL_SIZE,
+            WHISPER_DEVICE,
+            WHISPER_COMPUTE_TYPE,
+        )
+        try:
+            _whisper_model = WhisperModel(
+                WHISPER_MODEL_SIZE,
+                device=WHISPER_DEVICE,
+                compute_type=WHISPER_COMPUTE_TYPE,
+            )
+        except Exception:
+            if WHISPER_DEVICE.lower() != "cuda":
+                raise
+            logging.exception(
+                "Could not load faster-whisper with CUDA; falling back to CPU int8."
+            )
+            _whisper_model = WhisperModel(
+                WHISPER_MODEL_SIZE,
+                device="cpu",
+                compute_type="int8",
+            )
         logging.info("faster-whisper model loaded.")
     return _whisper_model
 
@@ -961,7 +987,7 @@ async def _speak(session: VoiceSession, text: str):
 
     # Wait for any current playback to finish rather than overlapping.
     while session.voice_client.is_playing():
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.15)
 
     def _cleanup(error):
         if error:
