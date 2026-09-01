@@ -24,7 +24,9 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TARGET_CHANNEL_IDS_STR = os.getenv("TARGET_CHANNEL_IDS") or os.getenv("TARGET_CHANNEL_ID")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "Velina-V1")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL")
+if not OLLAMA_MODEL:
+    sys.exit("ERROR: OLLAMA_MODEL is missing. Check your .env file.")
 OLLAMA_URL = "http://localhost:11434/api/chat"
 # Ollama unloads inactive models after its default keep-alive period. Set this
 # to values such as "5m", "30m", "1h", or "-1" to keep the model loaded.
@@ -463,8 +465,6 @@ def save_personas(personas: dict) -> None:
 
 def load_state() -> None:
     """Restore persistent bot state if a previous state file exists."""
-    global OLLAMA_MODEL
-
     if not os.path.exists(STATE_FILE):
         return
 
@@ -525,10 +525,6 @@ def load_state() -> None:
             except (TypeError, ValueError):
                 continue
 
-    saved_model = state.get("ollama_model")
-    if isinstance(saved_model, str) and saved_model.strip():
-        OLLAMA_MODEL = saved_model.strip()
-
     logging.info("Loaded persistent bot state from %s", STATE_FILE)
 
 
@@ -549,7 +545,6 @@ def save_state() -> None:
         },
         "paused_channel_ids": sorted(PAUSED_CHANNEL_IDS),
         "disabled_join_channel_ids": sorted(DISABLED_JOIN_CHANNEL_IDS),
-        "ollama_model": OLLAMA_MODEL,
     }
     temporary_state_file = f"{STATE_FILE}.tmp"
     try:
