@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import logging
+import queue
 import random
 import re
 import tempfile
@@ -17,7 +18,7 @@ from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 import azure.cognitiveservices.speech as speechsdk
-from typing import Any, Optional, cast
+from typing import Any, Awaitable, Callable, Optional, cast
 
 load_dotenv()
 
@@ -25,6 +26,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TARGET_CHANNEL_IDS_STR = os.getenv("TARGET_CHANNEL_IDS") or os.getenv("TARGET_CHANNEL_ID")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "Velina-V1")
 OLLAMA_URL = "http://localhost:11434/api/chat"
+# Ollama unloads inactive models after its default keep-alive period. Set this
+# to values such as "5m", "30m", "1h", or "-1" to keep the model loaded.
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 
 if not DISCORD_TOKEN:
     sys.exit("ERROR: DISCORD_TOKEN is missing. Check your .env file.")
@@ -377,7 +381,7 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 # environment and are intentionally not hard-coded.
 AZURE_TTS_API_KEY = os.getenv("AZURE_TTS_API_KEY")
 AZURE_TTS_REGION = os.getenv("AZURE_TTS_REGION")
-TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AvaMultilingualNeural")
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AshleyNeural")
 # Speed/volume/pitch tweaks. Format matches edge-tts's own syntax and also
 # works as Azure SSML <prosody> values:
 #   rate/volume: signed percentage, e.g. "+15%" or "-10%"
@@ -400,6 +404,10 @@ VOICE_MIN_UTTERANCE_BYTES = int(VOICE_SAMPLE_RATE * 2 * 2 * 0.5)  # ~0.5s
 # one) doesn't silence the bot everywhere else, like your own private
 # testing channel.
 PAUSED_CHANNEL_IDS: set = set()
+# Text channels where the owner has disabled voice joining. This is separate
+# from DISABLED_CHANNEL_IDS because text/AI responses can remain enabled while
+# voice sessions are blocked to conserve resources.
+DISABLED_JOIN_CHANNEL_IDS: set = set()
 
 # Filled in on_ready.
 bot_start_time: Optional[float] = None
@@ -509,6 +517,14 @@ def load_state() -> None:
             except (TypeError, ValueError):
                 continue
 
+    saved_disabled_join = state.get("disabled_join_channel_ids", [])
+    if isinstance(saved_disabled_join, list):
+        for channel_id in saved_disabled_join:
+            try:
+                DISABLED_JOIN_CHANNEL_IDS.add(int(channel_id))
+            except (TypeError, ValueError):
+                continue
+
     saved_model = state.get("ollama_model")
     if isinstance(saved_model, str) and saved_model.strip():
         OLLAMA_MODEL = saved_model.strip()
@@ -532,6 +548,7 @@ def save_state() -> None:
             for channel_id, persona in CHANNEL_PERSONAS.items()
         },
         "paused_channel_ids": sorted(PAUSED_CHANNEL_IDS),
+        "disabled_join_channel_ids": sorted(DISABLED_JOIN_CHANNEL_IDS),
         "ollama_model": OLLAMA_MODEL,
     }
     temporary_state_file = f"{STATE_FILE}.tmp"
@@ -576,7 +593,11 @@ def clean_reply(reply: str) -> str:
     return reply.strip()
 
 
-async def call_ollama(messages: list, options: Optional[dict] = None) -> str:
+async def call_ollama(
+    messages: list,
+    options: Optional[dict] = None,
+    on_sentence: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> str:
     """Low-level call to Ollama given a fully-built messages list. Does not
     touch conversation_history itself -- callers are responsible for that,
     since different commands (normal chat, /regenerate, /start) build and
@@ -590,7 +611,8 @@ async def call_ollama(messages: list, options: Optional[dict] = None) -> str:
     payload = {
         "model": OLLAMA_MODEL,
         "messages": messages,
-        "stream": False,
+        "stream": on_sentence is not None,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
     }
     if options:
         payload["options"] = options
@@ -603,8 +625,38 @@ async def call_ollama(messages: list, options: Optional[dict] = None) -> str:
             if resp.status != 200:
                 text = await resp.text()
                 raise RuntimeError(f"Ollama error {resp.status}: {text}")
-            data = await resp.json()
-            return clean_reply(data["message"]["content"])
+            if on_sentence is None:
+                data = await resp.json()
+                return clean_reply(data["message"]["content"])
+
+            # Stream Ollama's response and forward completed sentences as
+            # soon as they are available. The complete response is still
+            # assembled and cleaned before it is returned to the caller.
+            pieces = []
+            sentence_buffer = ""
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                if data.get("done"):
+                    break
+                piece = data.get("message", {}).get("content", "")
+                if not piece:
+                    continue
+                pieces.append(piece)
+                sentence_buffer += piece
+
+                sentences = re.split(r"(?<=[.!?])\s+", sentence_buffer)
+                sentence_buffer = sentences.pop()
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if sentence:
+                        await on_sentence(sentence)
+
+            if sentence_buffer.strip():
+                await on_sentence(sentence_buffer.strip())
+            return clean_reply("".join(pieces))
 
 
 async def query_ollama(
@@ -612,6 +664,7 @@ async def query_ollama(
     user_message: str,
     user_id: Optional[int] = None,
     author_name: Optional[str] = None,
+    on_sentence: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Optional[str]:
     if user_id is not None and is_muted(user_id):
         # On cooldown from repeated injection attempts -- ignore entirely
@@ -646,7 +699,7 @@ async def query_ollama(
     messages = build_prompt_messages(channel_id, history[-MAX_HISTORY:])
 
     try:
-        reply = await call_ollama(messages)
+        reply = await call_ollama(messages, on_sentence=on_sentence)
     except Exception:
         # Do not leave an incomplete user turn behind when Ollama fails.
         # This prevents a retry from seeing a stale request with no answer.
@@ -897,6 +950,16 @@ def _voice_write_callback(guild_id: int):
     return callback
 
 
+async def _voice_tts_worker(session: VoiceSession, sentence_queue: asyncio.Queue):
+    """Speak streamed response sentences in order while Ollama continues
+    generating the remainder of the reply."""
+    while True:
+        sentence = await sentence_queue.get()
+        if sentence is None:
+            return
+        await _speak(session, sentence)
+
+
 async def _transcribe_and_respond(guild_id: int, user_id: int, pcm_bytes: bytes):
     session = voice_sessions.get(guild_id)
     if session is None:
@@ -920,7 +983,12 @@ async def _transcribe_and_respond(guild_id: int, user_id: int, pcm_bytes: bytes)
     try:
         def _run_transcription():
             model = get_whisper_model()
-            segments, _info = model.transcribe(wav_path, beam_size=1)
+            segments, _info = model.transcribe(
+                                wav_path,
+                                language="en",
+                                beam_size=1,
+                                condition_on_previous_text=False,
+                                )
             return " ".join(seg.text for seg in segments).strip()
 
         text = await loop.run_in_executor(None, _run_transcription)
@@ -944,13 +1012,33 @@ async def _transcribe_and_respond(guild_id: int, user_id: int, pcm_bytes: bytes)
     member = guild.get_member(user_id) if guild is not None else None
     speaker = member.display_name if member else f"User {user_id}"
 
+    sentence_queue: asyncio.Queue = asyncio.Queue()
+    tts_task = asyncio.create_task(_voice_tts_worker(session, sentence_queue))
+    streamed_sentence_count = 0
+
+    async def enqueue_sentence(sentence: str):
+        nonlocal streamed_sentence_count
+        sentence = sentence.strip()
+        if sentence:
+            streamed_sentence_count += 1
+            await sentence_queue.put(sentence)
+
     try:
         # Voice input shares the same channel history as text input. Use the
         # channel lock so both paths cannot mutate history or summarize it at
-        # the same time.
+        # the same time. Ollama streams completed sentences to Azure while
+        # the remainder of the answer is still being generated.
         async with get_channel_lock(session.text_channel_id):
-            reply = await query_ollama(session.text_channel_id, text, user_id, speaker)
+            reply = await query_ollama(
+                session.text_channel_id,
+                text,
+                user_id,
+                speaker,
+                on_sentence=enqueue_sentence,
+            )
     except Exception as e:
+        await sentence_queue.put(None)
+        await tts_task
         logging.exception("Error querying Ollama from voice input")
         if text_channel is not None:
             await text_channel.send(f"⚠️ Error generating response: {e}")
@@ -959,12 +1047,97 @@ async def _transcribe_and_respond(guild_id: int, user_id: int, pcm_bytes: bytes)
     if reply is None:
         # User is on an injection-attempt cooldown -- stay silent (no text
         # reply, no TTS playback).
+        await sentence_queue.put(None)
+        await tts_task
         return
 
+    # If no sentence was emitted (for example, a short response without
+    # punctuation), still speak the completed reply once.
+    if streamed_sentence_count == 0:
+        await sentence_queue.put(reply)
+    await sentence_queue.put(None)
+
+    # Post the text while the first queued sentence is already being
+    # synthesized/played by Azure.
     if text_channel is not None:
         await send_chunked(text_channel, f"🎙️ **{speaker}:** {text}\n{reply}")
 
-    await _speak(session, reply)
+    await tts_task
+
+class _AzurePCMSource(discord.AudioSource):
+    """Discord audio source fed incrementally by Azure's push stream.
+
+    Azure provides raw 48 kHz mono PCM in arbitrary-sized chunks. Discord's
+    player expects 20 ms, 48 kHz stereo PCM frames, so this source duplicates
+    each mono sample and buffers the result until a complete frame is ready.
+    """
+
+    FRAME_BYTES = 3840  # 20 ms at 48 kHz, 16-bit, stereo
+
+    def __init__(self):
+        self._chunks: queue.Queue[Optional[bytes]] = queue.Queue()
+        self._buffer = bytearray()
+        self._close_signaled = False
+        self._ended = False
+
+    def push_mono_pcm(self, audio_buffer: memoryview) -> int:
+        mono = bytes(audio_buffer)
+        mono = mono[: len(mono) - (len(mono) % 2)]
+        stereo = bytearray(len(mono) * 2)
+        # Each sample is 16 bits (two bytes). Duplicate the complete sample
+        # into both left and right channels; copying only alternating bytes
+        # would corrupt the PCM waveform and produce static.
+        for mono_offset in range(0, len(mono), 2):
+            stereo_offset = mono_offset * 2
+            sample = mono[mono_offset : mono_offset + 2]
+            stereo[stereo_offset : stereo_offset + 2] = sample
+            stereo[stereo_offset + 2 : stereo_offset + 4] = sample
+        self._chunks.put(bytes(stereo))
+        return len(audio_buffer)
+
+    def close(self):
+        if not self._close_signaled:
+            self._close_signaled = True
+            self._chunks.put(None)
+
+    def read(self) -> bytes:
+        while not self._ended and len(self._buffer) < self.FRAME_BYTES:
+            try:
+                chunk = self._chunks.get(timeout=30)
+            except queue.Empty:
+                self._ended = True
+                break
+            if chunk is None:
+                self._ended = True
+                break
+            self._buffer.extend(chunk)
+
+        if not self._buffer:
+            return b""
+
+        frame = bytes(self._buffer[: self.FRAME_BYTES])
+        del self._buffer[: self.FRAME_BYTES]
+        if len(frame) < self.FRAME_BYTES:
+            frame += b"\x00" * (self.FRAME_BYTES - len(frame))
+        return frame
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self):
+        self.close()
+
+
+class _AzurePushCallback(speechsdk.audio.PushAudioOutputStreamCallback):
+    def __init__(self, source: _AzurePCMSource):
+        super().__init__()
+        self.source = source
+
+    def write(self, audio_buffer: memoryview) -> int:
+        return self.source.push_mono_pcm(audio_buffer)
+
+    def close(self):
+        self.source.close()
 
 
 async def _speak(session: VoiceSession, text: str):
@@ -975,40 +1148,40 @@ async def _speak(session: VoiceSession, text: str):
         logging.error("Azure TTS is not configured: AZURE_TTS_API_KEY or AZURE_TTS_REGION is missing.")
         return
 
-    mp3_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
-    try:
-        # The Azure Speech SDK call is synchronous, so keep it off the event
-        # loop while it synthesizes the MP3 file.
-        voice_name = TTS_VOICE.strip()
-        locale = "-".join(voice_name.split(":", 1)[0].split("-")[:2])
-        ssml = (
-            f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' "
-            f"xml:lang='{html.escape(locale, quote=True)}'>"
-            f"<voice name='{html.escape(voice_name, quote=True)}'>"
-            f"<prosody rate='{html.escape(TTS_RATE, quote=True)}' "
-            f"volume='{html.escape(TTS_VOLUME, quote=True)}' "
-            f"pitch='{html.escape(TTS_PITCH, quote=True)}'>"
-            f"{html.escape(text[:3000])}"
-            "</prosody></voice></speak>"
-        )
+    # Wait for any current playback to finish before starting a new stream.
+    while session.voice_client.is_playing():
+        await asyncio.sleep(0.15)
 
-        def _synthesize():
+    voice_name = TTS_VOICE.strip()
+    locale = "-".join(voice_name.split(":", 1)[0].split("-")[:2])
+    ssml = (
+        f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' "
+        f"xml:lang='{html.escape(locale, quote=True)}'>"
+        f"<voice name='{html.escape(voice_name, quote=True)}'>"
+        f"<prosody rate='{html.escape(TTS_RATE, quote=True)}' "
+        f"volume='{html.escape(TTS_VOLUME, quote=True)}' "
+        f"pitch='{html.escape(TTS_PITCH, quote=True)}'>"
+        f"{html.escape(text[:3000])}"
+        "</prosody></voice></speak>"
+    )
+    source = _AzurePCMSource()
+
+    def _synthesize():
+        try:
             speech_config = speechsdk.SpeechConfig(
                 subscription=AZURE_TTS_API_KEY,
                 region=AZURE_TTS_REGION,
             )
             speech_config.speech_synthesis_voice_name = voice_name
             speech_config.set_speech_synthesis_output_format(
-                speechsdk.SpeechSynthesisOutputFormat.Audio24Khz160KBitRateMonoMp3
+                speechsdk.SpeechSynthesisOutputFormat.Raw48Khz16BitMonoPcm
             )
-            audio_config = speechsdk.audio.AudioOutputConfig(filename=mp3_path)
+            push_stream = speechsdk.audio.PushAudioOutputStream(_AzurePushCallback(source))
+            audio_config = speechsdk.audio.AudioOutputConfig(stream=push_stream)
             synthesizer = speechsdk.SpeechSynthesizer(
                 speech_config=speech_config,
                 audio_config=audio_config,
             )
-            # The Azure SDK's type hints incorrectly describe this future's
-            # result as potentially None/RecognitionResult. At runtime this
-            # returns a SpeechSynthesisResult, so narrow it explicitly here.
             result = cast(Any, synthesizer.speak_ssml_async(ssml).get())
             if result is None:
                 raise RuntimeError("Azure TTS returned no synthesis result.")
@@ -1017,29 +1190,15 @@ async def _speak(session: VoiceSession, text: str):
                 raise RuntimeError(
                     f"Azure TTS failed: {details.reason}; {details.error_details}"
                 )
+        finally:
+            source.close()
 
+    try:
+        session.voice_client.play(source)
         await asyncio.get_running_loop().run_in_executor(None, _synthesize)
     except Exception:
-        logging.exception("TTS generation failed")
-        try:
-            os.remove(mp3_path)
-        except OSError:
-            pass
-        return
-
-    # Wait for any current playback to finish rather than overlapping.
-    while session.voice_client.is_playing():
-        await asyncio.sleep(0.15)
-
-    def _cleanup(error):
-        if error:
-            logging.error("Voice playback error: %s", error)
-        try:
-            os.remove(mp3_path)
-        except OSError:
-            pass
-
-    session.voice_client.play(discord.FFmpegPCMAudio(mp3_path), after=_cleanup)
+        source.close()
+        logging.exception("TTS generation or playback failed")
 
 
 async def _silence_watcher(guild_id: int):
@@ -1555,8 +1714,14 @@ async def stats_command(interaction: discord.Interaction):
     uptime_str = f"{hours}h {minutes}m {seconds}s"
 
     status = "PAUSED" if interaction.channel_id in PAUSED_CHANNEL_IDS else "active"
+    voice_status = (
+        "disabled"
+        if interaction.channel_id in DISABLED_JOIN_CHANNEL_IDS
+        else "enabled"
+    )
     lines = [
         f"**Status:** {status}",
+        f"**Voice:** {voice_status}",
         f"**Uptime:** {uptime_str}",
         f"**Latency:** {round(bot.latency * 1000)}ms",
         f"**Messages processed:** {message_count}",
@@ -1601,6 +1766,9 @@ OWNER_COMMANDS = [
     ("/pause [channel]", "Stop the bot from responding in a channel (default: current channel). Other channels are unaffected."),
     ("/resume [channel]", "Resume the bot responding in a channel (default: current channel)."),
     ("/list_paused", "List channels the bot is currently paused in."),
+    ("/disable_join [channel]", "Prevent /join from creating a voice session for a channel."),
+    ("/enable_join [channel]", "Allow /join again for a channel."),
+    ("/list_join_disabled", "List channels where voice joining is disabled."),
 ]
 
 
@@ -1641,6 +1809,13 @@ async def join_command(interaction: discord.Interaction):
 
     channel_id = await require_channel_id(interaction)
     if channel_id is None:
+        return
+
+    if channel_id in DISABLED_JOIN_CHANNEL_IDS:
+        await interaction.response.send_message(
+            "-- Voice joining is disabled for this channel. --",
+            ephemeral=True,
+        )
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1729,6 +1904,70 @@ async def removechannel_command(interaction: discord.Interaction, channel: disco
 async def listchannels_command(interaction: discord.Interaction):
     mentions = ", ".join(f"<#{cid}>" for cid in TARGET_CHANNEL_IDS)
     await interaction.response.send_message(f"Active channels: {mentions}", ephemeral=True)
+
+
+@bot.tree.command(name="disable_join", description="[Owner only] Prevent voice joining for a channel")
+@owner_only()
+@app_commands.describe(channel="Channel where /join should be blocked; defaults to this channel")
+async def disable_join_command(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+):
+    channel_id = channel.id if channel is not None else interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message(
+            "-- Choose a text channel when using this command outside a channel. --",
+            ephemeral=True,
+        )
+        return
+
+    DISABLED_JOIN_CHANNEL_IDS.add(channel_id)
+    save_state()
+    where = channel.mention if channel is not None else "this channel"
+    await interaction.response.send_message(
+        f"-- Voice joining disabled for {where}. Text responses remain unchanged. --",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="enable_join", description="[Owner only] Allow voice joining for a channel")
+@owner_only()
+@app_commands.describe(channel="Channel where /join should be allowed; defaults to this channel")
+async def enable_join_command(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+):
+    channel_id = channel.id if channel is not None else interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message(
+            "-- Choose a text channel when using this command outside a channel. --",
+            ephemeral=True,
+        )
+        return
+
+    DISABLED_JOIN_CHANNEL_IDS.discard(channel_id)
+    save_state()
+    where = channel.mention if channel is not None else "this channel"
+    await interaction.response.send_message(
+        f"-- Voice joining enabled for {where}. --",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="list_join_disabled", description="[Owner only] List channels where voice joining is disabled")
+@owner_only()
+async def list_join_disabled_command(interaction: discord.Interaction):
+    if not DISABLED_JOIN_CHANNEL_IDS:
+        await interaction.response.send_message(
+            "-- Voice joining is enabled in all channels. --",
+            ephemeral=True,
+        )
+        return
+    mentions = ", ".join(f"<#{cid}>" for cid in sorted(DISABLED_JOIN_CHANNEL_IDS))
+    await interaction.response.send_message(
+        f"Voice joining disabled in: {mentions}",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="setmodel", description="[Owner only] Change the Ollama model in use")
