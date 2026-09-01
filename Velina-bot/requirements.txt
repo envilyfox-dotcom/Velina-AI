@@ -5,3 +5,4 @@ aiohttp
 python-dotenv
 faster-whisper
 azure-cognitiveservices-speech
+edge-tts
