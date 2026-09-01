@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import html
 import json
 import logging
 import random
@@ -15,8 +16,8 @@ from discord import app_commands
 from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
-import edge_tts
-from typing import Optional
+import azure.cognitiveservices.speech as speechsdk
+from typing import Any, Optional, cast
 
 load_dotenv()
 
@@ -372,9 +373,10 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")  # tiny/base/small/
 # are installed.
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-# TTS runs via free edge-tts (no API key needed -- uses the same cloud
-# voices as Microsoft Edge's "Read Aloud" feature). Full voice list: run
-# `edge-tts --list-voices`, or see https://github.com/rany2/edge-tts
+# TTS runs through Azure Speech. The key and region are loaded from the
+# environment and are intentionally not hard-coded.
+AZURE_TTS_API_KEY = os.getenv("AZURE_TTS_API_KEY")
+AZURE_TTS_REGION = os.getenv("AZURE_TTS_REGION")
 TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AvaMultilingualNeural")
 # Speed/volume/pitch tweaks. Format matches edge-tts's own syntax and also
 # works as Azure SSML <prosody> values:
@@ -969,14 +971,54 @@ async def _speak(session: VoiceSession, text: str):
     if session.voice_client is None or not session.voice_client.is_connected():
         return
 
+    if not AZURE_TTS_API_KEY or not AZURE_TTS_REGION:
+        logging.error("Azure TTS is not configured: AZURE_TTS_API_KEY or AZURE_TTS_REGION is missing.")
+        return
+
     mp3_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
     try:
-        # edge-tts is natively async (it streams over a websocket), so no
-        # executor thread is needed here.
-        communicate = edge_tts.Communicate(
-            text[:3000], voice=TTS_VOICE, rate=TTS_RATE, volume=TTS_VOLUME, pitch=TTS_PITCH
+        # The Azure Speech SDK call is synchronous, so keep it off the event
+        # loop while it synthesizes the MP3 file.
+        voice_name = TTS_VOICE.strip()
+        locale = "-".join(voice_name.split(":", 1)[0].split("-")[:2])
+        ssml = (
+            f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' "
+            f"xml:lang='{html.escape(locale, quote=True)}'>"
+            f"<voice name='{html.escape(voice_name, quote=True)}'>"
+            f"<prosody rate='{html.escape(TTS_RATE, quote=True)}' "
+            f"volume='{html.escape(TTS_VOLUME, quote=True)}' "
+            f"pitch='{html.escape(TTS_PITCH, quote=True)}'>"
+            f"{html.escape(text[:3000])}"
+            "</prosody></voice></speak>"
         )
-        await communicate.save(mp3_path)
+
+        def _synthesize():
+            speech_config = speechsdk.SpeechConfig(
+                subscription=AZURE_TTS_API_KEY,
+                region=AZURE_TTS_REGION,
+            )
+            speech_config.speech_synthesis_voice_name = voice_name
+            speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Audio24Khz160KBitRateMonoMp3
+            )
+            audio_config = speechsdk.audio.AudioOutputConfig(filename=mp3_path)
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=speech_config,
+                audio_config=audio_config,
+            )
+            # The Azure SDK's type hints incorrectly describe this future's
+            # result as potentially None/RecognitionResult. At runtime this
+            # returns a SpeechSynthesisResult, so narrow it explicitly here.
+            result = cast(Any, synthesizer.speak_ssml_async(ssml).get())
+            if result is None:
+                raise RuntimeError("Azure TTS returned no synthesis result.")
+            if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+                details = speechsdk.CancellationDetails(result)
+                raise RuntimeError(
+                    f"Azure TTS failed: {details.reason}; {details.error_details}"
+                )
+
+        await asyncio.get_running_loop().run_in_executor(None, _synthesize)
     except Exception:
         logging.exception("TTS generation failed")
         try:

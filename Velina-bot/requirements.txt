@@ -4,4 +4,4 @@ PyNaCl
 aiohttp
 python-dotenv
 faster-whisper
-edge-tts
+azure-cognitiveservices-speech
