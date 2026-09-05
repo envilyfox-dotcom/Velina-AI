@@ -382,6 +382,15 @@ def clean_reply(reply: str) -> str:
         reply
     )
 
+    # Remove an accidental leading bracket-style label, e.g. "[Azuria
+    # replies]" or "[Azuria's reply]" -- a pattern the model can pick up
+    # from the [User]/[Azuria] markers used in multi-turn training data.
+    reply = re.sub(
+        r'^[[^]\n]{1,40}]\s*',
+        '',
+        reply
+    ).strip()
+
     # Stop if the model starts generating another person's turn.
     match = re.search(
         r'\n+[A-Za-z0-9_][A-Za-z0-9_\s\-]{0,40}:\s+',
